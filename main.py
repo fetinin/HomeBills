@@ -1,32 +1,30 @@
 import logging
 import math
-import shelve
+import threading
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+import sheet
+import storage
+
 app = FastAPI()
+g_sheet = sheet.Sheet()
+readings = storage.Storage()
+readings.curr.load()
+readings.prev.load()
 
 logging.basicConfig(level=logging.DEBUG)
 
-storage = shelve.open("home_bills.db")
-if not storage.keys():
-    storage.update(
-        {
-            "electro": {},
-            "bath": {},
-            "kitchen": {},
-        }
-    )
-
+_rates = g_sheet.get_floats("C23", "C28")
 rates = {
-    "cold_water": 42.3,
-    "hot_water": 205.15,
-    "drain": 30.9,
-    "el_t1": 6.72,
-    "el_t2": 2.32,
-    "el_t3": 5.66,
+    "cold_water": _rates[0],
+    "hot_water": _rates[1],
+    "drain": _rates[2],
+    "el_t1": _rates[3],
+    "el_t2": _rates[4],
+    "el_t3": _rates[5],
 }
 
 
@@ -48,17 +46,17 @@ async def main(request: Request):
 
 def handle_dialog(data: dict[str, Any]) -> str:
     if data["session"]["new"]:
-        if not any(v for v in storage.values()):
+        if readings.curr.is_some_missing:
             return "Привет! Что там по счетчикам за воду и электричество?"
 
         places = []
-        if not storage["electro"]:
+        if not (readings.curr.el_t1 or readings.curr.el_t2 or readings.curr.el_t3):
             places.append("по электричеству")
 
-        if not storage["kitchen"]:
+        if not (readings.curr.kitchen_cold or readings.curr.kitchen_hot):
             places.append("воды на кухне")
 
-        if not storage["bath"]:
+        if not (readings.curr.bath_hot or readings.curr.bath_cold):
             places.append("воды в ванной")
 
         if places:
@@ -71,6 +69,11 @@ def handle_dialog(data: dict[str, Any]) -> str:
     nlu = data["request"]["nlu"]
     # Обрабатываем ответ пользователя.
 
+    if "обнови данные" in user_phrase:
+        readings.curr.load()
+        readings.prev.load()
+        return "Актуализировала данные из таблицы. Обращайтесь."
+
     if "кухня" in user_phrase or "кухне" in user_phrase:
         entities = nlu["entities"]
         if len(entities) != 1 or entities[0]["type"] != "YANDEX.NUMBER":
@@ -78,10 +81,10 @@ def handle_dialog(data: dict[str, Any]) -> str:
 
         amount = entities[0]["value"]
         if "горячая вода" in user_phrase:
-            storage["kitchen"] = {**storage["kitchen"], **{"hot_water": amount}}
+            readings.curr.kitchen_hot = str(amount)
             return f"Записала горячую воду на кухне {amount}"
         if "холодная вода" in user_phrase:
-            storage["kitchen"] = {**storage["kitchen"], **{"cold_water": amount}}
+            readings.curr.kitchen_cold = str(amount)
             return f"Записала холодную воду на кухне {amount}"
         else:
             return "Не поняла, это горячая или холодная вода?"
@@ -93,10 +96,10 @@ def handle_dialog(data: dict[str, Any]) -> str:
 
         amount = entities[0]["value"]
         if "горячая вода" in user_phrase:
-            storage["bath"] = {**storage["bath"], **{"hot_water": amount}}
+            readings.curr.bath_hot = str(amount)
             return f"Записала горячую воду в ванной: {amount}"
         if "холодная вода" in user_phrase:
-            storage["bath"] = {**storage["bath"], **{"cold_water": amount}}
+            readings.curr.bath_cold = str(amount)
             return f"Записала холодную воду в ванной {amount}"
         else:
             return "Не поняла, это горячая или холодная вода?"
@@ -110,7 +113,13 @@ def handle_dialog(data: dict[str, Any]) -> str:
         if 0 <= rate > 3:
             return "Не поняла, это по какому тарифу? Есть тарифы: 1, 2 и 3"
 
-        storage["electro"] = {**storage["electro"], **{rate: amount}}
+        if rate == 1:
+            readings.curr.el_t1 = str(amount)
+        elif rate == 2:
+            readings.curr.el_t2 = str(amount)
+        else:
+            readings.curr.el_t3 = str(amount)
+
         return f"Записала электричество по тарифу {rate} как {amount}"
 
     if "сколько вышло" in user_phrase:
@@ -120,47 +129,48 @@ def handle_dialog(data: dict[str, Any]) -> str:
 
 
 def calc_bill() -> str:
-    if not any(v for v in storage.values()):
+    if readings.curr.is_some_missing:
         return "У меня пока нет показаний. Продиктуй их, пожалуйста"
 
     missing_places = []
-    if not (electro := storage["electro"]):
-        missing_places.append("по электричеству")
-    else:
-        if len(electro) < 3:
-            missing_rates = (str(m) for m in {1, 2, 3}.difference(electro.keys()))
+
+    missing_rates = []
+    if not readings.curr.el_t1:
+        missing_places.append("1")
+    if not readings.curr.el_t2:
+        missing_places.append("2")
+    if not readings.curr.el_t3:
+        missing_places.append("3")
+
+    if missing_rates:
+        if len(missing_rates) == 3:
+            missing_places.append("по электричеству")
+        else:
             missing_places.append(
-                f"по тарифам электричества {' и '.join(missing_rates)}"
-            )
+                f"по тарифам электричества {' и '.join(missing_rates)}")
 
-    if not (kitchen := storage["kitchen"]):
-        missing_places.append("воды на кухне")
-    else:
-        if not kitchen["hot_water"]:
-            missing_places.append(f"горячей воды на кухне")
-        if not kitchen["cold_water"]:
-            missing_places.append(f"холодной воды на кухне")
+    if not readings.curr.kitchen_hot:
+        missing_places.append(f"горячей воды на кухне")
+    if not readings.curr.kitchen_cold:
+        missing_places.append(f"холодной воды на кухне")
 
-    if not (bath := storage["bath"]):
-        missing_places.append("воды в ванной")
-    else:
-        if not bath["hot_water"]:
-            missing_places.append(f"горячей воды на кухне")
-        if not bath["cold_water"]:
-            missing_places.append(f"холодной воды на кухне")
+    if not readings.curr.bath_hot:
+        missing_places.append(f"горячей воды в ванной")
+    if not readings.curr.bath_cold:
+        missing_places.append(f"холодной воды в ванной")
 
     if missing_places:
         return f"Нехватает показаний {' и '.join(missing_places)}."
 
-    cold_water = (storage["bath"]["cold_water"] + storage["kitchen"]["cold_water"]) - (
-        14 + 11.6
+    cold_water = (readings.curr.bath_cold + readings.curr.kitchen_cold) - (
+            readings.prev.bath_cold + readings.prev.kitchen_cold
     )
-    hot_water = (storage["bath"]["hot_water"] + storage["kitchen"]["hot_water"]) - (
-        7 + 5.5
+    hot_water = (readings.curr.bath_hot + readings.curr.kitchen_hot) - (
+            readings.prev.bath_hot + readings.prev.kitchen_hot
     )
-    el_t1 = storage["electro"][1] - 352
-    el_t2 = storage["electro"][2] - 198
-    el_t3 = storage["electro"][3] - 530
+    el_t1 = readings.curr.el_t1 - readings.prev.el_t1
+    el_t2 = readings.curr.el_t2 - readings.prev.el_t2
+    el_t3 = readings.curr.el_t3 - readings.prev.el_t3
 
     cold_water_price = cold_water * rates["cold_water"]
     hot_water_price = hot_water * rates["hot_water"]
@@ -180,13 +190,27 @@ def calc_bill() -> str:
         )
     )
 
-    rubles, kopeek = to_money(total)
-    rub_text = get_num_endings(rubles, ["рубль", "рублей", "рубля"])
-    kopeek_text = get_num_endings(rubles, ["копейка", "копеек", "копейка"])
+    def update_data():
+        readings.curr.total_cold = cold_water_price
+        readings.curr.total_hot = hot_water_price
+        readings.curr.total_drain = drain_price
+        readings.curr.total_t1 = el_t1_price
+        readings.curr.total_t2 = el_t2_price
+        readings.curr.total_t3 = el_t3_price
+        readings.curr.total_all = total
 
-    return (
-        f"В этом месяце коммуналка вышла на {rubles} {rub_text} {kopeek} {kopeek_text}."
-    )
+    threading.Thread(target=update_data).start()  # update data in background
+
+    total_this_month_phrase = f"В этом месяце коммуналка вышла на {money_as_text(total)}."
+
+    if readings.prev.total_all > total:
+        diff = readings.prev.total_all - total
+        total_tip = f"Это на {money_as_text(diff)} меньше чем в прошлом. Так держать!"
+    else:
+        diff = total - readings.prev.total_all
+        total_tip = f"Прошлый месяц вышел дешевле, на {money_as_text(diff)}."
+
+    return f"{total_this_month_phrase} {total_tip}"
 
 
 def to_money(money: float) -> (int, int):
@@ -208,7 +232,13 @@ def get_num_endings(number: int, words: list[str]) -> str:
 
     return words[1]
 
+def money_as_text(total: float) -> str:
+    rubles, kopeek = to_money(total)
+    rub_text = get_num_endings(rubles, ["рубль", "рублей", "рубля"])
+    kopeek_text = get_num_endings(kopeek, ["копейка", "копеек", "копейка"])
+    return f"{rubles} {rub_text} {kopeek} {kopeek_text}"
 
 @app.on_event("shutdown")
 def shutdown_handler():
-    storage.close()
+    return
+
