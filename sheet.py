@@ -57,7 +57,7 @@ class Sheet:
         ).execute()
         values = res.get("values", [])
         if not values:
-            return ""
+            return []
 
         return [v[0] if v else "" for v in values]
 

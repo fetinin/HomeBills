@@ -35,7 +35,10 @@ class _Storage:
     def load(self):
         values = self._get_all()
         for k, cell in self._cells.items():
-            v = values[int(cell.idx) - self._sheet.header_offset]
+            try:
+                v = values[int(cell.idx) - self._sheet.header_offset]
+            except IndexError:
+                v = ""
             self._cells[k].data = v
 
     def _get_all(self):
@@ -176,7 +179,7 @@ class _Storage:
 
 
 class Storage:
-    _months_cells_names = " FGHIJKLMNOP"
+    _months_cells_names = " FGHIJKLMNOPQ"
 
     def __init__(self):
         curr_month = datetime.datetime.today().month
